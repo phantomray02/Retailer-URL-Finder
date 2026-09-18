@@ -121,6 +121,14 @@ STRICT_LIVE_RETAILER_ONLY = True
 STRICT_COMPARISON_MODE = True
 ALLOW_RETAILER_KNOWN_COPY_FALLBACKS = False
 ALLOW_RETAILER_GENERATED_IMAGE_FALLBACKS = False
+
+# Brand compliance report mode. The retailer side must contain only content
+# observed in a verified live retailer capture. No known-copy catalogs,
+# generated image URLs, Salsify mirroring, or other rescue content may populate
+# retailer fields or contribute to scores.
+BRAND_COMPLIANCE_LIVE_ONLY = True
+ALLOW_TARGETED_RETAILER_COPY_RESCUE = False
+REQUIRE_VERIFIED_RETAILER_PRODUCT_IDENTITY = True
 STRICT_CVS_VARIANT_MATCH = True
 CVS_VARIANT_MIN_MATCH_SCORE = 35
 
@@ -2966,6 +2974,9 @@ def build_kroger_compact_capture_from_raw_html(raw_html_text, requested_url="", 
 
 # =========================================================
 # CVS CAPTURE AND PARSING
+CVS_PARSE_ONLY_IN_APP = True
+CVS_IGNORE_EXTENSION_PARSED_JSON = True
+CVS_APP_PARSER_FIX_VERSION = "2026-09-18.1"
 # =========================================================
 def build_cvs_compact_capture_from_parsed_json(payload):
     """Build compact parse-friendly CVS HTML from browser-extension output."""
@@ -3452,53 +3463,65 @@ def parse_uploaded_raw_html_map(raw_text, selected_retailer=""):
         final_url_from_payload = clean_uploaded_url_value(final_url_match.group(1)) if final_url_match else ""
 
         if "kroger.com" in requested_url_lc:
-            html_text = build_kroger_compact_capture_from_capture_block(block, requested_url=requested_url, final_url=final_url_from_payload)
+            html_text = build_kroger_compact_capture_from_capture_block(
+                block,
+                requested_url=requested_url,
+                final_url=final_url_from_payload,
+            )
+        elif "cvs.com" in requested_url_lc:
+            # CVS is parsed only inside this app. Ignore the extension PARSED JSON
+            # and preserve the complete captured HTML for the exact CVS item.
+            html_match = re.search(
+                r'(?is)-----BEGIN HTML-----(.*?)-----END HTML-----',
+                block,
+            )
+            html_text = (
+                html.unescape(str(html_match.group(1) or "").strip())
+                if html_match
+                else ""
+            )
         else:
             compact_html = ""
             parsed_payload = {}
-            parsed_match = re.search(r'(?is)-----BEGIN PARSED JSON-----(.*?)-----END PARSED JSON-----', block)
+            parsed_match = re.search(
+                r'(?is)-----BEGIN PARSED JSON-----(.*?)-----END PARSED JSON-----',
+                block,
+            )
             if parsed_match:
                 try:
                     parsed_payload = json.loads(str(parsed_match.group(1) or "").strip())
                     if requested_url and "heb.com" in requested_url_lc:
                         compact_html = build_heb_compact_capture_from_parsed_json(parsed_payload)
-                    elif requested_url and "cvs.com" in requested_url_lc:
-                        compact_html = build_cvs_compact_capture_from_parsed_json(parsed_payload)
                     elif requested_url and "samsclub.com" in requested_url_lc:
                         compact_html = build_sams_compact_capture_from_parsed_json(parsed_payload)
                     else:
-                        compact_html = build_kroger_compact_capture_from_parsed_json(parsed_payload)
+                        compact_html = build_compact_capture_from_parsed_json(parsed_payload)
                 except Exception:
-                    parsed_payload = {}
                     compact_html = ""
-            if not final_url_from_payload and isinstance(parsed_payload, dict):
-                final_url_from_payload = clean_uploaded_url_value(parsed_payload.get("finalUrl", ""))
-            html_match = re.search(r'(?is)-----BEGIN HTML-----(.*?)-----END HTML-----', block)
-            raw_html_text = html.unescape(str(html_match.group(1) or "").strip()) if html_match else ""
+            final_url_from_payload = clean_uploaded_url_value(
+                parsed_payload.get("finalUrl", "")
+            ) or final_url_from_payload
+            html_match = re.search(
+                r'(?is)-----BEGIN HTML-----(.*?)-----END HTML-----',
+                block,
+            )
+            raw_html_text = (
+                html.unescape(str(html_match.group(1) or "").strip())
+                if html_match
+                else ""
+            )
             if compact_html:
-                if requested_url and "cvs.com" in requested_url.lower() and raw_html_text:
-                    cvs_raw_compact = build_cvs_compact_capture_from_raw_html(raw_html_text, requested_url=requested_url, final_url=final_url_from_payload)
-                    html_text = compact_html + ("\n" + cvs_raw_compact if cvs_raw_compact else "")
-                elif requested_url and "samsclub.com" in requested_url.lower():
-                    # The extension PARSED JSON is exact-product scoped. Keep Sam's Club
-                    # isolated to that verified copy/gallery instead of appending raw page
-                    # ASR assets from recommendations, reviews, or shared parent content.
-                    html_text = compact_html
-                elif requested_url and "heb.com" in requested_url.lower() and raw_html_text:
-                    # HEB-only stable fix: keep compact parsed copy and append only tiny current-item image URLs.
-                    # Do not append full raw HTML because it can make the uploaded map huge and crash Streamlit.
-                    rpc_for_images = ""
-                    if isinstance(parsed_payload, dict):
-                        rpc_for_images = parsed_payload.get("rpc", "") or parsed_payload.get("sku", "") or ""
-                    image_snippet = _build_heb_compact_image_snippet(raw_html_text, target_rpc=rpc_for_images)
+                if requested_url and "heb.com" in requested_url_lc and raw_html_text:
+                    image_snippet = build_heb_compact_image_snippet_from_raw_html(
+                        raw_html_text,
+                        requested_url=requested_url,
+                        final_url=final_url_from_payload,
+                    )
                     html_text = compact_html + ("\n" + image_snippet if image_snippet else "")
                 else:
                     html_text = compact_html
             else:
-                if requested_url and "cvs.com" in requested_url_lc:
-                    html_text = build_cvs_compact_capture_from_raw_html(raw_html_text, requested_url=requested_url, final_url=final_url_from_payload)
-                else:
-                    html_text = raw_html_text
+                html_text = raw_html_text
 
         if requested_url and "kroger.com" in requested_url.lower() and html_text and not is_valid_kroger_product_capture(html_text):
             html_text = build_kroger_invalid_capture_stub(requested_url=requested_url, final_url=final_url_from_payload, reason="invalid_kroger_shell_or_product_unavailable_capture")
@@ -5921,7 +5944,10 @@ def is_cvs_retailer_image_url(url):
         return False
     return bool(
         "/bizcontent/merchandising/productimages/high_res/" in lowered
-        or "cvs.com/bizcontent/merchandising/productimages/high_res/" in lowered
+        or "cvs.com/bizcontent/merchandising/productimages/" in lowered
+        or "damassetlibrary.cvsimages.com/" in lowered
+        or "cvsimages.com/" in lowered
+        or "adobeaemcloud.com/" in lowered
     )
 
 
@@ -5936,6 +5962,13 @@ def sanitize_cvs_retailer_images(image_urls, debug=None, reason=""):
     seen = set()
     for raw_url in image_urls or []:
         url = html.unescape(str(raw_url or "").strip()).replace("\\/", "/")
+        url = url.replace("\\u002F", "/").replace("\u002F", "/")
+        if url.startswith("//"):
+            url = "https:" + url
+        elif url.startswith("/"):
+            url = "https://www.cvs.com" + url
+        if url.startswith("http://localhost:4300/"):
+            url = "https://www.cvs.com/" + url[len("http://localhost:4300/"):]
         if not url:
             continue
         if not is_cvs_retailer_image_url(url):
@@ -6725,10 +6758,46 @@ def merge_feature_continuations(items, max_features=5):
     return dedupe_preserve_order(merged[:max_features])
 
 
+def is_cvs_non_product_feature(value):
+    """CVS-only guard against page chrome being scored as product copy."""
+    text = normalize_space(html.unescape(str(value or "")))
+    lowered = text.lower().strip(" .:-")
+    if not lowered:
+        return True
+
+    exact_noise = {
+        "household", "paper & plastic", "paper and plastic", "toilet paper",
+        "pickup within 1 hour", "same-day delivery", "same day delivery",
+        "enter address", "shipping", "delivery", "pickup", "ingredients",
+        "reviews", "customer reviews", "details", "description",
+        "checkbox label label", "shop", "categories",
+    }
+    if lowered in exact_noise:
+        return True
+
+    noise_patterns = [
+        r"^(pickup|delivery|shipping)(\s|$)",
+        r"^(same[- ]day delivery|enter address)(\s|$)",
+        r"^(household|paper (&|and) plastic|toilet paper)$",
+        r"^(reviews?|ingredients?|directions?|warnings?)$",
+        r"^(vaccines?|glp-?1|pharmacy|photo)(\s|$)",
+        r"^(buy again|frequently bought|you may also like|recommended)(\s|$)",
+    ]
+    if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in noise_patterns):
+        return True
+
+    # Real CVS bullets contain a meaningful claim or explanatory phrase. Very short
+    # category labels without punctuation are navigation, not product features.
+    if len(text) < 24 and not any(ch in text for ch in [":", "-", "—", ";", ","]):
+        return True
+    return False
+
+
 def normalize_cvs_features(items):
     cleaned = [clean_cvs_feature_text(x) for x in items if isinstance(x, str)]
-    cleaned = [x for x in cleaned if x]
+    cleaned = [x for x in cleaned if x and not is_cvs_non_product_feature(x)]
     cleaned = merge_feature_continuations(cleaned, max_features=5)
+    cleaned = [x for x in cleaned if x and not is_cvs_non_product_feature(x)]
     return dedupe_preserve_order(cleaned[:5])
 
 
@@ -13366,6 +13435,130 @@ def get_visual_row_payload(
         "r_images": payload["r_images"],
     }
 
+
+# =========================================
+# BRAND COMPLIANCE LIVE-ONLY FIREWALL
+# =========================================
+_COMPLIANCE_DISALLOWED_SOURCE_TOKENS = (
+    "fallback", "rescue", "generated", "mirror_salsify", "known_product",
+    "known_copy", "manual_copy", "historical_copy",
+)
+
+
+def _compliance_digits(value):
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _compliance_gtin_from_url(value):
+    text = str(value or "")
+    matches = re.findall(r"(?<!\d)(\d{12,14})(?!\d)", text)
+    return matches[-1] if matches else ""
+
+
+def _compliance_gtin_from_capture(value):
+    text = str(value or "")
+    patterns = (
+        r'"sku"\s*:\s*"(\d{12,14})"',
+        r'"gtin(?:12|13|14)?"\s*:\s*"(\d{12,14})"',
+        r'\b(?:UPC|GTIN|Captured GTIN|Product ID)\s*[:#]?\s*(\d{12,14})\b',
+        r'/p/(\d{12,14})(?:[/?#]|$)',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _compliance_gtin_equal(left, right):
+    left = _compliance_digits(left)
+    right = _compliance_digits(right)
+    if not left or not right:
+        return False
+    return left == right or left.lstrip("0") == right.lstrip("0")
+
+
+def apply_brand_compliance_live_only_firewall(payload, retailer_name="", retail_url="", row_source_code=""):
+    """Fail closed before scoring so only verified observed retailer content remains."""
+    if not BRAND_COMPLIANCE_LIVE_ONLY:
+        return payload
+
+    r_text = payload.get("r_text") if isinstance(payload, dict) else None
+    if not isinstance(r_text, dict):
+        r_text = {"title": "", "description": "", "features": [], "debug": {}}
+        payload["r_text"] = r_text
+    debug = r_text.setdefault("debug", {})
+    source_blob = " | ".join(str(debug.get(key, "")) for key in (
+        "Source Used", "Title Path", "Description Path", "Features Path", "Image Path"
+    )).lower()
+
+    blocked_reasons = []
+    if any(token in source_blob for token in _COMPLIANCE_DISALLOWED_SOURCE_TOKENS):
+        r_text["title"] = ""
+        r_text["description"] = ""
+        r_text["features"] = []
+        payload["r_images"] = []
+        blocked_reasons.append("NON_LIVE_RETAILER_FALLBACK_REMOVED")
+
+    clean_images = []
+    for image_url in payload.get("r_images", []) or []:
+        value = str(image_url or "").strip()
+        lowered = value.lower()
+        if not value:
+            continue
+        if "salsify" in lowered or "images.salsify.com" in lowered or "assets.salsify.com" in lowered:
+            blocked_reasons.append("SALSIFY_RETAILER_IMAGE_REMOVED")
+            continue
+        if any(token in lowered for token in ("generated_fallback", "placeholder", "data:image/")):
+            blocked_reasons.append("NON_LIVE_RETAILER_IMAGE_REMOVED")
+            continue
+        clean_images.append(value)
+    payload["r_images"] = clean_images
+
+    retailer_norm = normalize_retailer_name(retailer_name).strip().lower()
+    requested_gtin = _compliance_gtin_from_url(retail_url)
+    captured_gtin = _compliance_gtin_from_capture(row_source_code)
+    identity_status = "NOT_REQUIRED"
+    if retailer_norm == "kroger" and REQUIRE_VERIFIED_RETAILER_PRODUCT_IDENTITY:
+        if requested_gtin and captured_gtin and _compliance_gtin_equal(requested_gtin, captured_gtin):
+            identity_status = "VERIFIED"
+        elif requested_gtin and captured_gtin:
+            identity_status = "INVALID_PDP_MATCH"
+        else:
+            identity_status = "IDENTITY_UNVERIFIED"
+        if identity_status != "VERIFIED":
+            r_text["title"] = ""
+            r_text["description"] = ""
+            r_text["features"] = []
+            payload["r_images"] = []
+            blocked_reasons.append(identity_status)
+
+    debug["Compliance Mode"] = "LIVE_RETAILER_ONLY"
+    debug["Fallback Applied"] = "No"
+    debug["Requested GTIN"] = requested_gtin
+    debug["Captured GTIN"] = captured_gtin
+    debug["Product Identity Status"] = identity_status
+    debug["Compliance Eligible"] = not blocked_reasons
+    debug["Compliance Block Reason"] = " | ".join(dict.fromkeys(blocked_reasons))
+    return payload
+
+
+# Hard stop for legacy retailer backup mechanisms in compliance mode. These
+# overrides are intentionally placed after the legacy definitions.
+def get_cvs_known_product_fallback_bundle(retail_url="", target_rpc=""):
+    return {"text": {"title": "", "description": "", "features": [], "debug": {
+        "Source Used": "disabled_in_brand_compliance_mode",
+        "Compliance Block Reason": "KNOWN_COPY_FALLBACK_DISABLED",
+    }}, "images": []}
+
+
+def apply_cvs_targeted_copy_rescue_if_needed(bundle, retail_url="", target_rpc="", reason=""):
+    return bundle
+
+
+def add_cvs_generated_image_fallback_if_needed(bundle, retail_url="", target_rpc="", reason=""):
+    return bundle
+
 def process_row(row):
     try:
         retail_url = row.get("retail_url", "")
@@ -13478,6 +13671,12 @@ def process_row(row):
             max_slots=MAX_IMAGE_SLOTS_TO_SCORE,
         )
 
+        comparison_payload = apply_brand_compliance_live_only_firewall(
+            comparison_payload,
+            retailer_name=retailer_name,
+            retail_url=retail_url,
+            row_source_code=row_source_code,
+        )
         s_text = comparison_payload["s_text"]
         s_images = comparison_payload["s_images"]
         r_text = comparison_payload["r_text"]
@@ -14743,6 +14942,59 @@ if (
             st.info(
                 "No visually reviewable items found. Products without retailer URLs are still included in the extract."
             )
+            st.stop()
+
+        # Option 1: table-first review of the completed QA results.
+        table_df = pd.DataFrame(st.session_state.get("summary_rows", []))
+        if table_df.empty:
+            table_df = visual_df.copy()
+
+        preferred_columns = [
+            "Retailer", "Brand", "SKU", "Retailer RPC", "Kroger RPC",
+            "Title %", "Description %", "Feature %", "Image Match %",
+            "Overall %", "Status", "Salsify URL", "Retail URL",
+        ]
+        visible_columns = [col for col in preferred_columns if col in table_df.columns]
+        if not visible_columns:
+            visible_columns = list(table_df.columns)
+
+        st.markdown("### Table Review")
+        st.caption(
+            "Review the completed QA results in a sortable table, then export the visible rows to CSV."
+        )
+        table_search = st.text_input(
+            "Filter table",
+            placeholder="Type a SKU, brand, status, retailer, or other value",
+            key="visual_table_filter",
+        ).strip()
+
+        display_table_df = table_df.loc[:, visible_columns].copy()
+        if table_search:
+            search_mask = display_table_df.astype(str).apply(
+                lambda col: col.str.contains(table_search, case=False, na=False)
+            ).any(axis=1)
+            display_table_df = display_table_df.loc[search_mask].copy()
+
+        st.dataframe(
+            display_table_df,
+            use_container_width=True,
+            hide_index=True,
+            height=min(760, max(220, 38 * (len(display_table_df) + 1))),
+        )
+        st.download_button(
+            "Download table as CSV",
+            data=display_table_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"pdp_qa_table_{safe_retailer}.csv",
+            mime="text/csv",
+            key="download_visual_table_csv",
+        )
+
+        show_detailed_cards = st.toggle(
+            "Show detailed visual comparison cards",
+            value=False,
+            key="show_detailed_visual_cards",
+        )
+        if not show_detailed_cards:
             st.stop()
 
         for _, row in visual_df.iterrows():

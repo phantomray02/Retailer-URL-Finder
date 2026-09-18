@@ -130,7 +130,6 @@ BRAND_COMPLIANCE_LIVE_ONLY = True
 ALLOW_TARGETED_RETAILER_COPY_RESCUE = False
 REQUIRE_VERIFIED_RETAILER_PRODUCT_IDENTITY = True
 STRICT_CVS_VARIANT_MATCH = True
-CVS_EXACT_VARIANT_OBJECT_PARSER = True
 CVS_VARIANT_MIN_MATCH_SCORE = 35
 
 CAPTURE_MODE_USE_EXTENSION = "Use extension + TXT upload"
@@ -7458,116 +7457,108 @@ def extract_vendor_copy_from_nextjs(html_text, target_rpc="", retail_url=""):
 
 
 
-def extract_exact_cvs_variant_from_html(html_text, retail_url="", target_rpc=""):
-    """Parse one CVS variant by exact skuId/RPC from captured page HTML.
+def parse_cvs_capture_record_in_app(html_text, retail_url="", target_rpc=""):
+    """CVS-only parser for one extension capture record.
 
-    The CVS page can contain multiple product/variant objects. This function
-    accepts only the object whose id exactly equals the requested CVS RPC.
+    Each uploaded record is already scoped to one CVS URL/RPC. Parse the product
+    fields directly from that record instead of rescanning page-wide DOM text or
+    requiring a complete parent variant object.
     """
-    rpc = re.sub(r"\D+", "", str(get_cvs_effective_sku_id(retail_url, target_rpc) or ""))
-    debug = {"CVS Exact Variant RPC": rpc, "CVS Exact Variant Matched": False}
-    if not rpc or not html_text:
-        return {"title": "", "description": "", "features": [], "images": [], "debug": debug}
-
-    sources = []
     raw = str(html_text or "")
-    for candidate in [raw, html.unescape(raw), get_nextjs_chunks(raw)]:
-        candidate = str(candidate or "").replace("\\u002F", "/").replace("\\/", "/")
-        if candidate and candidate not in sources:
-            sources.append(candidate)
+    decoded = html.unescape(raw).replace("\\u002F", "/").replace("\\/", "/")
+    debug = {
+        "Source Used": "cvs_capture_record_app_parser",
+        "CVS Capture Record Length": len(raw),
+        "CVS App Parser RPC": re.sub(r"\\D+", "", str(get_cvs_effective_sku_id(retail_url, target_rpc) or "")),
+    }
 
-    def decode_jsonish_string(value):
+    def decode_value(value):
         value = str(value or "")
         try:
             return json.loads('"' + value + '"')
         except Exception:
             return html.unescape(value.replace('\\"', '"').replace("\\n", " ").replace("\\/", "/"))
 
-    def first_string(block, keys):
+    def field(keys):
         for key in keys:
-            m = re.search(r'"' + re.escape(key) + r'"\s*:\s*"((?:\\.|[^"\\])*)"', block, flags=re.DOTALL)
-            if m:
-                value = clean_cvs_text_refined(decode_jsonish_string(m.group(1)))
+            match = re.search(r'"' + re.escape(key) + r'"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"', decoded, flags=re.DOTALL)
+            if match:
+                value = clean_cvs_text_refined(decode_value(match.group(1)))
                 if value:
                     return value
         return ""
 
-    for source in sources:
-        id_matches = list(re.finditer(r'"id"\s*:\s*"' + re.escape(rpc) + r'"', source))
-        for id_match in id_matches:
-            # Find the containing object for the exact id, expanding backward to
-            # candidate opening braces and accepting the first balanced object that
-            # contains this id plus CVS product markers.
-            object_block = ""
-            search_start = max(0, id_match.start() - 180000)
-            brace_positions = [m.start() for m in re.finditer(r'\{', source[search_start:id_match.start()])]
-            for rel_pos in reversed(brace_positions):
-                pos = search_start + rel_pos
-                block = extract_balanced_brace_block(source, pos)
-                if not block or id_match.start() >= pos + len(block):
-                    continue
-                if re.search(r'"id"\s*:\s*"' + re.escape(rpc) + r'"', block) and (
-                    '"upcImages"' in block or '"vendorContent"' in block or '"displayName"' in block
-                ):
-                    object_block = block
-                    break
-            if not object_block:
+    title = field(["title", "displayName"])
+    description = field(["vendorDetailsParagraph"])
+
+    features = []
+    array_match = re.search(r'"vendorDetailsBullets"\\s*:\\s*\\[', decoded, flags=re.DOTALL)
+    if array_match:
+        array_text = extract_balanced_bracket_block(decoded, array_match.end() - 1)
+        try:
+            values = json.loads(array_text)
+        except Exception:
+            values = [decode_value(m.group(1)) for m in re.finditer(r'"((?:\\\\.|[^"\\\\])*)"', array_text[1:-1], flags=re.DOTALL)]
+        if isinstance(values, list):
+            features = normalize_cvs_features([str(value) for value in values])
+
+    images = []
+    seen = set()
+    image_match = re.search(r'"upcImages"\\s*:\\s*\\[', decoded, flags=re.DOTALL)
+    if image_match:
+        image_array = extract_balanced_bracket_block(decoded, image_match.end() - 1)
+        # Preserve CVS gallery order. Prefer dynamicMediaUrl and then imageName.
+        starts = [m.start() for m in re.finditer(r'\\{', image_array)]
+        consumed_until = -1
+        for start in starts:
+            if start < consumed_until:
                 continue
+            obj = extract_balanced_brace_block(image_array, start)
+            if not obj:
+                continue
+            consumed_until = start + len(obj)
+            dynamic = ""
+            image_name = ""
+            for key, destination in [("dynamicMediaUrl", "dynamic"), ("imageName", "image")]:
+                match = re.search(r'"' + key + r'"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"', obj, flags=re.DOTALL)
+                if match:
+                    value = html.unescape(decode_value(match.group(1))).replace("\\/", "/")
+                    if destination == "dynamic":
+                        dynamic = value
+                    else:
+                        image_name = value
+            image_url = dynamic or image_name
+            if image_url.startswith("/"):
+                image_url = "https://www.cvs.com" + image_url
+            if image_url.startswith(("http://", "https://")):
+                key = image_url.split("?", 1)[0].lower()
+                if key not in seen:
+                    seen.add(key)
+                    images.append(image_url)
 
-            title = first_string(object_block, ["title", "displayName"])
-            description = first_string(object_block, ["vendorDetailsParagraph"])
+    # Some compact captures contain product image URLs without a retained upcImages
+    # wrapper. Use only explicit CVS product image hosts from this same item record.
+    if not images:
+        candidates = extract_cvs_images_from_html(decoded)
+        images = sanitize_cvs_retailer_images(candidates)
 
-            features = []
-            marker = re.search(r'"vendorDetailsBullets"\s*:\s*\[', object_block, flags=re.DOTALL)
-            if marker:
-                arr = extract_balanced_bracket_block(object_block, marker.end() - 1)
-                try:
-                    parsed = json.loads(arr)
-                    if isinstance(parsed, list):
-                        features = [clean_cvs_text_refined(x) for x in parsed]
-                except Exception:
-                    for m in re.finditer(r'"((?:\\.|[^"\\])*)"', arr[1:-1], flags=re.DOTALL):
-                        features.append(clean_cvs_text_refined(decode_jsonish_string(m.group(1))))
-            features = normalize_cvs_features(features)
-
-            images = []
-            seen = set()
-            image_marker = re.search(r'"upcImages"\s*:\s*\[', object_block, flags=re.DOTALL)
-            if image_marker:
-                image_array = extract_balanced_bracket_block(object_block, image_marker.end() - 1)
-                for item_start in [m.start() for m in re.finditer(r'\{', image_array)]:
-                    image_obj = extract_balanced_brace_block(image_array, item_start)
-                    if not image_obj:
-                        continue
-                    dynamic_url = first_string(image_obj, ["dynamicMediaUrl"])
-                    image_name = first_string(image_obj, ["imageName"])
-                    image_url = dynamic_url or image_name
-                    image_url = html.unescape(str(image_url or "")).replace("\\/", "/")
-                    if image_url.startswith("/"):
-                        image_url = "https://www.cvs.com" + image_url
-                    if not image_url.startswith(("http://", "https://")):
-                        continue
-                    key = image_url.split("?", 1)[0].lower()
-                    if key and key not in seen:
-                        seen.add(key)
-                        images.append(image_url)
-
-            if title or description or features or images:
-                debug.update({
-                    "CVS Exact Variant Matched": True,
-                    "CVS Exact Variant Title": title,
-                    "CVS Exact Variant Feature Count": len(features),
-                    "CVS Exact Variant Image Count": len(images),
-                })
-                return {
-                    "title": title,
-                    "description": description,
-                    "features": features[:5],
-                    "images": images[:MAX_IMAGE_SLOTS_TO_COMPARE],
-                    "debug": debug,
-                }
-
-    return {"title": "", "description": "", "features": [], "images": [], "debug": debug}
+    debug.update({
+        "CVS App Parser Title Found": bool(title),
+        "CVS App Parser Description Found": bool(description),
+        "CVS App Parser Feature Count": len(features),
+        "CVS App Parser Image Count": len(images),
+    })
+    return {
+        "text": {
+            "title": title,
+            "description": description,
+            "features": features[:5],
+            "rating": "",
+            "review_count": "",
+            "debug": debug,
+        },
+        "images": images[:MAX_IMAGE_SLOTS_TO_COMPARE],
+    }
 
 def extract_cvs_images_from_html(html_text):
     html_text = str(html_text or "")
@@ -11715,22 +11706,15 @@ def get_retailer_bundle(retailer_name, retail_url, target_rpc="", sku="", row_so
 
     if uploaded_html.strip():
         if retailer == "cvs":
-            cvs_uploaded_html = extract_cvs_relevant_source_chunk(uploaded_html, retail_url=retail_url, target_rpc=target_rpc)
-            exact_variant = extract_exact_cvs_variant_from_html(cvs_uploaded_html, retail_url=retail_url, target_rpc=target_rpc)
-            if exact_variant.get("debug", {}).get("CVS Exact Variant Matched"):
-                uploaded_bundle = {
-                    "text": {
-                        "title": exact_variant.get("title", ""),
-                        "description": exact_variant.get("description", ""),
-                        "features": exact_variant.get("features", [])[:5],
-                        "rating": "",
-                        "review_count": "",
-                        "debug": exact_variant.get("debug", {}),
-                    },
-                    "images": exact_variant.get("images", []),
-                }
-            else:
-                uploaded_bundle = {"text": _extract_cvs_text_from_html(cvs_uploaded_html, retail_url=retail_url, target_rpc=target_rpc), "images": extract_cvs_images_from_html(cvs_uploaded_html)}
+            # The capture importer already matched this row to one CVS record.
+            # Parse that complete record in the app without applying a second source
+            # window that can remove vendorDetails/upcImages.
+            cvs_uploaded_html = uploaded_html
+            uploaded_bundle = parse_cvs_capture_record_in_app(
+                cvs_uploaded_html,
+                retail_url=retail_url,
+                target_rpc=target_rpc,
+            )
             upload_debug = uploaded_bundle.setdefault("text", {}).setdefault("debug", {})
             upload_debug["Source Used"] = "uploaded_txt_html"
             upload_debug["CVS Uploaded HTML Length"] = len(uploaded_html)

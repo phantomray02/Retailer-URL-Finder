@@ -3484,15 +3484,15 @@ def parse_uploaded_raw_html_map(raw_text, selected_retailer=""):
             capture_number_match = re.search(r'(?im)^=+\s*PDP CAPTURE\s+(\d+)\s*=+', block)
             capture_rpc_match = re.search(r'(?im)^RPC\s*:\s*([^\r\n]+)', block)
             capture_number = str(capture_number_match.group(1) or "").strip() if capture_number_match else ""
-            capture_rpc = str(capture_rpc_match.group(1) or "").replace(".0", "").strip() if capture_rpc_match else ""
-            metadata_lines = [
+            capture_rpc = re.sub(r"[^0-9A-Za-z_-]", "", str(capture_rpc_match.group(1) or "").replace(".0", "").strip()) if capture_rpc_match else ""
+            capture_metadata = [
                 "CVS-Capture-Number: " + capture_number,
                 "CVS-Capture-RPC: " + capture_rpc,
                 "CVS-Capture-Requested-URL: " + requested_url,
                 "CVS-Capture-Final-URL: " + final_url_from_payload,
                 "CVS-Capture-Raw-HTML-Length: " + str(len(captured_html)),
             ]
-            html_text = "\n".join(metadata_lines) + "\n" + captured_html if captured_html else ""
+            html_text = "\n".join(capture_metadata) + "\n" + captured_html if captured_html else ""
         else:
             compact_html = ""
             parsed_payload = {}
@@ -7475,29 +7475,25 @@ def extract_vendor_copy_from_nextjs(html_text, target_rpc="", retail_url=""):
 
 
 def parse_cvs_capture_record_in_app(html_text, retail_url="", target_rpc=""):
-    """Parse one matched CVS extension HTML record strictly inside the app.
-
-    CVS data is read only from the escaped Next.js product-state script. The exact
-    variant id must equal target_rpc. No page-wide copy/image fallback is used.
-    """
+    """Parse exactly one matched CVS capture using its decoded Next.js product state."""
     raw = str(html_text or "")
     requested_rpc = re.sub(r"[^0-9A-Za-z_-]", "", str(target_rpc or "").replace(".0", "").strip())
 
-    def meta_value(name):
+    def capture_meta(name):
         match = re.search(r"(?im)^CVS-Capture-" + re.escape(name) + r":\s*(.*?)\s*$", raw)
         return str(match.group(1) or "").strip() if match else ""
 
-    capture_number = meta_value("Number")
-    matched_requested_url = meta_value("Requested-URL")
-    matched_final_url = meta_value("Final-URL")
-    matched_capture_rpc = meta_value("RPC")
+    capture_number = capture_meta("Number")
+    matched_requested_url = capture_meta("Requested-URL")
+    matched_final_url = capture_meta("Final-URL")
+    capture_rpc = capture_meta("RPC")
     raw_html_length = len(raw)
-    length_meta = meta_value("Raw-HTML-Length")
-    if str(length_meta).isdigit():
-        raw_html_length = int(length_meta)
+    raw_length_meta = capture_meta("Raw-HTML-Length")
+    if raw_length_meta.isdigit():
+        raw_html_length = int(raw_length_meta)
 
     debug = {
-        "Source Used": "cvs_exact_nextjs_variant_parser",
+        "Source Used": "uploaded_txt_html_exact_cvs_variant",
         "Requested CVS RPC": requested_rpc,
         "Matched capture number": capture_number,
         "Matched requested URL": matched_requested_url,
@@ -7511,19 +7507,17 @@ def parse_cvs_capture_record_in_app(html_text, retail_url="", target_rpc=""):
         "Feature count": 0,
         "Image count": 0,
         "Final CVS image URLs": [],
-        "CVS parser failure reason": "",
+        "Reason for CVS parser failure": "",
     }
 
-    def clean_entity_text(value):
+    def clean_value(value):
         value = str(value or "")
-        # Decode nested HTML entities without altering JSON syntax or punctuation.
-        for _ in range(4):
-            decoded_value = html.unescape(value)
-            if decoded_value == value:
+        for _ in range(5):
+            decoded = html.unescape(value)
+            if decoded == value:
                 break
-            value = decoded_value
-        value = re.sub(r"\s+", " ", value).strip()
-        return value
+            value = decoded
+        return re.sub(r"\s+", " ", value).strip()
 
     def walk(value):
         yield value
@@ -7536,65 +7530,60 @@ def parse_cvs_capture_record_in_app(html_text, retail_url="", target_rpc=""):
 
     payloads = []
     soup = BeautifulSoup(raw, "html.parser")
-    scripts = soup.find_all("script")
-    for script in scripts:
+    for script in soup.find_all("script"):
         script_text = script.string if script.string is not None else script.get_text("", strip=False)
         script_text = str(script_text or "")
-        if not script_text or not any(token in script_text for token in ("productData", "vendorDetailsBullets", "upcImages")):
+        if not script_text or not any(marker in script_text for marker in ("productData", "vendorDetailsBullets", "upcImages")):
             continue
         debug["Product-state payload found"] = True
 
-        # CVS currently stores the product state in self.__next_f.push([index, "escaped payload"]).
-        # Parse the push argument as JSON so escaped quotes, slashes and unicode are decoded safely.
         for push_match in re.finditer(r"self\.__next_f\.push\s*\(", script_text):
-            array_start = script_text.find("[", push_match.end())
-            if array_start < 0:
+            start = script_text.find("[", push_match.end())
+            if start < 0:
                 continue
+            depth = 0
             in_string = False
             escaped = False
-            depth = 0
-            array_end = -1
-            for pos in range(array_start, len(script_text)):
-                ch = script_text[pos]
+            end = -1
+            for pos in range(start, len(script_text)):
+                char = script_text[pos]
                 if in_string:
                     if escaped:
                         escaped = False
-                    elif ch == "\\":
+                    elif char == "\\":
                         escaped = True
-                    elif ch == '"':
+                    elif char == '"':
                         in_string = False
                     continue
-                if ch == '"':
+                if char == '"':
                     in_string = True
-                elif ch == "[":
+                elif char == "[":
                     depth += 1
-                elif ch == "]":
+                elif char == "]":
                     depth -= 1
                     if depth == 0:
-                        array_end = pos + 1
+                        end = pos + 1
                         break
-            if array_end < 0:
+            if end < 0:
                 continue
             try:
-                push_value = json.loads(script_text[array_start:array_end])
+                push_data = json.loads(script_text[start:end])
             except Exception:
                 continue
-            if not isinstance(push_value, list):
+            if not isinstance(push_data, list):
                 continue
-            for entry in push_value[1:]:
+            for entry in push_data[1:]:
                 if not isinstance(entry, str):
                     continue
                 candidate = entry.strip()
-                json_start_candidates = [p for p in (candidate.find("{"), candidate.find("[")) if p >= 0]
-                if not json_start_candidates:
+                starts = [index for index in (candidate.find("{"), candidate.find("[")) if index >= 0]
+                if not starts:
                     continue
-                candidate = candidate[min(json_start_candidates):]
                 try:
-                    payloads.append(json.loads(candidate))
+                    payloads.append(json.loads(candidate[min(starts):]))
                 except Exception:
                     continue
 
-        # Also support a direct application/json product-state object if CVS emits one.
         direct = script_text.strip()
         if direct.startswith(("{", "[")):
             try:
@@ -7603,72 +7592,68 @@ def parse_cvs_capture_record_in_app(html_text, retail_url="", target_rpc=""):
                 pass
 
     debug["Product-state decoded"] = bool(payloads)
-    if not debug["Product-state payload found"]:
-        debug["CVS parser failure reason"] = "CVS product-state script was not found in the matched capture."
-    elif not payloads:
-        debug["CVS parser failure reason"] = "CVS product-state script was found but its escaped payload could not be decoded safely."
-
-    matched_product = None
-    matched_variant = None
+    product_data = None
+    exact_variant = None
     for payload in payloads:
         for node in walk(payload):
             if not isinstance(node, dict):
                 continue
-            product_data = node.get("productData")
-            if not isinstance(product_data, dict):
+            candidate_product = node.get("productData")
+            if not isinstance(candidate_product, dict):
                 continue
-            variants = product_data.get("variants")
+            variants = candidate_product.get("variants")
             if not isinstance(variants, list):
                 continue
             for variant in variants:
                 if isinstance(variant, dict) and str(variant.get("id", "")).strip() == requested_rpc:
-                    matched_product = product_data
-                    matched_variant = variant
+                    product_data = candidate_product
+                    exact_variant = variant
                     break
-            if matched_variant is not None:
+            if exact_variant is not None:
                 break
-        if matched_variant is not None:
+        if exact_variant is not None:
             break
 
-    debug["Exact variant RPC found"] = matched_variant is not None
-    if matched_variant is None and not debug["CVS parser failure reason"]:
-        if not requested_rpc:
-            debug["CVS parser failure reason"] = "No CVS Retailer RPC was supplied for exact variant matching."
-        elif matched_capture_rpc and matched_capture_rpc != requested_rpc:
-            debug["CVS parser failure reason"] = (
-                f"Matched capture RPC {matched_capture_rpc} does not equal requested CVS RPC {requested_rpc}."
-            )
-        else:
-            debug["CVS parser failure reason"] = f"Exact CVS variant id {requested_rpc} was not found in the decoded product state."
-
+    debug["Exact variant RPC found"] = exact_variant is not None
     title = ""
     description = ""
     features = []
     images = []
-    if matched_variant is not None:
-        title = clean_entity_text((matched_product or {}).get("title", ""))
-        vendor_content = matched_variant.get("vendorContent")
+
+    if exact_variant is None:
+        if not requested_rpc:
+            failure = "No CVS Retailer RPC was supplied for exact variant matching."
+        elif not debug["Product-state payload found"]:
+            failure = "CVS product-state script was not found in the matched capture."
+        elif not debug["Product-state decoded"]:
+            failure = "CVS product-state script was found but could not be decoded safely."
+        elif capture_rpc and capture_rpc != requested_rpc:
+            failure = f"Matched capture RPC {capture_rpc} does not equal requested CVS RPC {requested_rpc}."
+        else:
+            failure = f"Exact CVS variant id {requested_rpc} was not found in the decoded product state."
+        debug["Reason for CVS parser failure"] = failure
+    else:
+        title = clean_value((product_data or {}).get("title", ""))
+        vendor_content = exact_variant.get("vendorContent")
         vendor_details = vendor_content.get("vendorDetails") if isinstance(vendor_content, dict) else None
         if isinstance(vendor_details, dict):
-            description = clean_entity_text(vendor_details.get("vendorDetailsParagraph", ""))
-            bullet_values = vendor_details.get("vendorDetailsBullets")
-            if isinstance(bullet_values, list):
+            description = clean_value(vendor_details.get("vendorDetailsParagraph", ""))
+            bullets = vendor_details.get("vendorDetailsBullets")
+            if isinstance(bullets, list):
                 seen_features = set()
-                for bullet in bullet_values:
-                    clean_bullet = clean_entity_text(bullet)
-                    if clean_bullet and clean_bullet not in seen_features:
-                        seen_features.add(clean_bullet)
-                        features.append(clean_bullet)
+                for bullet in bullets:
+                    value = clean_value(bullet)
+                    if value and value not in seen_features:
+                        seen_features.add(value)
+                        features.append(value)
 
-        image_values = matched_variant.get("upcImages")
-        if isinstance(image_values, list):
-            seen_images = set()
-            for image_obj in image_values:
-                if not isinstance(image_obj, dict):
+        gallery = exact_variant.get("upcImages")
+        if isinstance(gallery, list):
+            seen_assets = set()
+            for image_object in gallery:
+                if not isinstance(image_object, dict):
                     continue
-                image_url = clean_entity_text(image_obj.get("dynamicMediaUrl", ""))
-                if not image_url:
-                    image_url = clean_entity_text(image_obj.get("imageName", ""))
+                image_url = clean_value(image_object.get("dynamicMediaUrl", "")) or clean_value(image_object.get("imageName", ""))
                 image_url = image_url.replace("\\/", "/")
                 if image_url.startswith("//"):
                     image_url = "https:" + image_url
@@ -7676,9 +7661,9 @@ def parse_cvs_capture_record_in_app(html_text, retail_url="", target_rpc=""):
                     image_url = "https://www.cvs.com" + image_url
                 if not re.match(r"^https?://", image_url, flags=re.IGNORECASE):
                     continue
-                duplicate_key = image_url.split("?", 1)[0].lower()
-                if duplicate_key not in seen_images:
-                    seen_images.add(duplicate_key)
+                asset_key = image_url.split("?", 1)[0].lower()
+                if asset_key not in seen_assets:
+                    seen_assets.add(asset_key)
                     images.append(image_url)
 
     debug.update({
@@ -11878,27 +11863,11 @@ def get_retailer_bundle(retailer_name, retail_url, target_rpc="", sku="", row_so
                 elif len(uploaded_bundle.get("images", []) or []) < 8:
                     upload_debug["CVS Image Fallback Skipped"] = "strict_live_retailer_only"
 
-            # CVS combined approach: always try both uploaded source and live CVS,
-            # then merge the richest title/description/features/images by field.
-            # This fixes partial captures where one path has copy and the other
-            # path has images. It remains CVS-only and never pulls Salsify into
-            # retailer fields.
-            live_bundle = get_cvs_bundle(retail_url, target_rpc)
-            merged_bundle = merge_cvs_bundles_prefer_richer_copy(uploaded_bundle, live_bundle)
-            merged_bundle = apply_cvs_targeted_copy_rescue_if_needed(
-                merged_bundle,
-                retail_url=retail_url,
-                target_rpc=target_rpc,
-                reason="uploaded_plus_live_missing_copy_or_wrong_target_rpc",
-            )
-            merged_bundle = add_cvs_generated_image_fallback_if_needed(
-                merged_bundle,
-                retail_url=retail_url,
-                target_rpc=target_rpc,
-                reason="uploaded_plus_live_had_no_parseable_images",
-            )
-            merged_bundle.setdefault("text", {}).setdefault("debug", {})["CVS Source Merge"] = "uploaded_txt_plus_live_always"
-            return merged_bundle
+            # A matched CVS TXT capture is the observed live retailer source for this row.
+            # Keep its exact-RPC parser result authoritative and do not merge live-fetch,
+            # catalog, generated-image, rescue, or Salsify content into CVS fields.
+            upload_debug["CVS Uploaded Capture Authoritative"] = True
+            return uploaded_bundle
         if retailer == "walgreens":
             bundle = {"text": extract_walgreens_text_from_html(uploaded_html, retail_url=retail_url, target_rpc=target_rpc), "images": extract_walgreens_images_from_html(uploaded_html)}
             bundle.setdefault("text", {}).setdefault("debug", {})["Source Used"] = "uploaded_txt_html"
@@ -14138,6 +14107,20 @@ def process_row(row):
                 "matchedDynamicMediaUrl": debug_data.get("matchedDynamicMediaUrl", ""),
                 "matchedVariantUrl": debug_data.get("matchedVariantUrl", ""),
                 "matchedNearbyImage": debug_data.get("matchedNearbyImage", ""),
+                "Requested CVS RPC": debug_data.get("Requested CVS RPC", ""),
+                "Matched capture number": debug_data.get("Matched capture number", ""),
+                "Matched requested URL": debug_data.get("Matched requested URL", ""),
+                "Matched final URL": debug_data.get("Matched final URL", ""),
+                "Raw matched HTML length": debug_data.get("Raw matched HTML length", 0),
+                "Product-state payload found": debug_data.get("Product-state payload found", False),
+                "Product-state decoded": debug_data.get("Product-state decoded", False),
+                "Exact variant RPC found": debug_data.get("Exact variant RPC found", False),
+                "Extracted title": debug_data.get("Extracted title", ""),
+                "CVS Description length": debug_data.get("Description length", 0),
+                "CVS Feature count": debug_data.get("Feature count", 0),
+                "CVS Image count": debug_data.get("Image count", 0),
+                "Final CVS image URLs": " | ".join(debug_data.get("Final CVS image URLs", []) or []),
+                "Reason for CVS parser failure": debug_data.get("Reason for CVS parser failure", ""),
                 **image_position_scores,
             },
             "debug": {
@@ -14192,6 +14175,20 @@ def process_row(row):
                 "rawTextHasVendorDetailsParagraph": debug_data.get("rawTextHasVendorDetailsParagraph", False),
                 "rawHtmlVendorExcerpt": debug_data.get("rawHtmlVendorExcerpt", ""),
                 "rawTextVendorExcerpt": debug_data.get("rawTextVendorExcerpt", ""),
+                "Requested CVS RPC": debug_data.get("Requested CVS RPC", ""),
+                "Matched capture number": debug_data.get("Matched capture number", ""),
+                "Matched requested URL": debug_data.get("Matched requested URL", ""),
+                "Matched final URL": debug_data.get("Matched final URL", ""),
+                "Raw matched HTML length": debug_data.get("Raw matched HTML length", 0),
+                "Product-state payload found": debug_data.get("Product-state payload found", False),
+                "Product-state decoded": debug_data.get("Product-state decoded", False),
+                "Exact variant RPC found": debug_data.get("Exact variant RPC found", False),
+                "Extracted title": debug_data.get("Extracted title", ""),
+                "CVS Description length": debug_data.get("Description length", 0),
+                "CVS Feature count": debug_data.get("Feature count", 0),
+                "CVS Image count": debug_data.get("Image count", 0),
+                "Final CVS image URLs": " | ".join(debug_data.get("Final CVS image URLs", []) or []),
+                "Reason for CVS parser failure": debug_data.get("Reason for CVS parser failure", ""),
             },
         }
 

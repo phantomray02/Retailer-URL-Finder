@@ -131,7 +131,7 @@ ALLOW_TARGETED_RETAILER_COPY_RESCUE = False
 REQUIRE_VERIFIED_RETAILER_PRODUCT_IDENTITY = True
 STRICT_CVS_VARIANT_MATCH = True
 CVS_VARIANT_MIN_MATCH_SCORE = 35
-CVS_PARSER_BUILD_ID = "cvs_exact_variant_20260918_132157_v2"
+CVS_PARSER_BUILD_ID = "cvs_exact_variant_20260918_132400_v3"
 
 CAPTURE_MODE_USE_EXTENSION = "Use extension + TXT upload"
 CAPTURE_MODE_SKIP_EXTENSION = "Skip extension and go straight to batch"
@@ -14509,15 +14509,23 @@ if uploaded_file:
                 raw_html_hash = hashlib.md5(raw_html_bytes or b"").hexdigest()
                 source_file_name_lc = str(uploaded_raw_html_file.name or "").lower().strip()
                 existing_source_stats = st.session_state.get("uploaded_raw_html_stats", {}) or {}
+                cvs_source_parser_outdated = (
+                    selected_retailer == "CVS"
+                    and existing_source_stats.get("cvs_parser_build_id") != CVS_PARSER_BUILD_ID
+                )
                 should_reparse_uploaded_source = (
                     st.session_state.raw_html_upload_hash != raw_html_hash
                     or not (st.session_state.get("uploaded_raw_html_map", {}) or {})
                     or st.session_state.uploaded_raw_html_filename != uploaded_raw_html_file.name
+                    or cvs_source_parser_outdated
                     or (source_file_name_lc.endswith(".xlsx") and existing_source_stats.get("mode") not in {"cvs_manual_source_xlsx", "extension_structured_results"})
                     or (source_file_name_lc.endswith(".csv") and existing_source_stats.get("mode") != "extension_structured_results")
                 )
                 if should_reparse_uploaded_source:
                     parsed_source_map, parsed_source_stats = parse_uploaded_retailer_source_file(raw_html_bytes, uploaded_raw_html_file.name, selected_retailer=selected_retailer)
+                    if selected_retailer == "CVS":
+                        parsed_source_stats = dict(parsed_source_stats or {})
+                        parsed_source_stats["cvs_parser_build_id"] = CVS_PARSER_BUILD_ID
                     st.session_state.uploaded_raw_html_map = parsed_source_map
                     st.session_state.uploaded_raw_html_stats = parsed_source_stats
                     st.session_state.uploaded_raw_html_filename = uploaded_raw_html_file.name

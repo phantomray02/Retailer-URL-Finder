@@ -131,6 +131,7 @@ ALLOW_TARGETED_RETAILER_COPY_RESCUE = False
 REQUIRE_VERIFIED_RETAILER_PRODUCT_IDENTITY = True
 STRICT_CVS_VARIANT_MATCH = True
 CVS_VARIANT_MIN_MATCH_SCORE = 35
+CVS_PARSER_BUILD_ID = "cvs_exact_variant_20260918_132157_v2"
 
 CAPTURE_MODE_USE_EXTENSION = "Use extension + TXT upload"
 CAPTURE_MODE_SKIP_EXTENSION = "Skip extension and go straight to batch"
@@ -14630,7 +14631,8 @@ if uploaded_file:
                 retailer_df = retailer_df.copy().reset_index(drop=True)
                 retailer_df["_queue_order"] = range(len(retailer_df))
 
-            current_batch_key = f"{file_hash}::{selected_retailer}::{capture_batch_key_part}::queued_{len(retailer_df)}"
+            cvs_parser_batch_part = f"::{CVS_PARSER_BUILD_ID}" if selected_retailer == "CVS" else ""
+            current_batch_key = f"{file_hash}::{selected_retailer}::{capture_batch_key_part}::queued_{len(retailer_df)}{cvs_parser_batch_part}"
 
             if st.session_state.active_batch_key != current_batch_key:
                 st.session_state.summary_rows = []

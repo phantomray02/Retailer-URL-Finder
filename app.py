@@ -2974,6 +2974,7 @@ def build_kroger_compact_capture_from_raw_html(raw_html_text, requested_url="", 
 
 # =========================================================
 # CVS CAPTURE AND PARSING
+CVS_APP_PARSER_FIX_VERSION = "2026-09-18.1"
 # =========================================================
 def build_cvs_compact_capture_from_parsed_json(payload):
     """Build compact parse-friendly CVS HTML from browser-extension output."""
@@ -5929,7 +5930,10 @@ def is_cvs_retailer_image_url(url):
         return False
     return bool(
         "/bizcontent/merchandising/productimages/high_res/" in lowered
-        or "cvs.com/bizcontent/merchandising/productimages/high_res/" in lowered
+        or "cvs.com/bizcontent/merchandising/productimages/" in lowered
+        or "damassetlibrary.cvsimages.com/" in lowered
+        or "cvsimages.com/" in lowered
+        or "adobeaemcloud.com/" in lowered
     )
 
 
@@ -5944,6 +5948,13 @@ def sanitize_cvs_retailer_images(image_urls, debug=None, reason=""):
     seen = set()
     for raw_url in image_urls or []:
         url = html.unescape(str(raw_url or "").strip()).replace("\\/", "/")
+        url = url.replace("\\u002F", "/").replace("\u002F", "/")
+        if url.startswith("//"):
+            url = "https:" + url
+        elif url.startswith("/"):
+            url = "https://www.cvs.com" + url
+        if url.startswith("http://localhost:4300/"):
+            url = "https://www.cvs.com/" + url[len("http://localhost:4300/"):]
         if not url:
             continue
         if not is_cvs_retailer_image_url(url):
@@ -6733,10 +6744,46 @@ def merge_feature_continuations(items, max_features=5):
     return dedupe_preserve_order(merged[:max_features])
 
 
+def is_cvs_non_product_feature(value):
+    """CVS-only guard against page chrome being scored as product copy."""
+    text = normalize_space(html.unescape(str(value or "")))
+    lowered = text.lower().strip(" .:-")
+    if not lowered:
+        return True
+
+    exact_noise = {
+        "household", "paper & plastic", "paper and plastic", "toilet paper",
+        "pickup within 1 hour", "same-day delivery", "same day delivery",
+        "enter address", "shipping", "delivery", "pickup", "ingredients",
+        "reviews", "customer reviews", "details", "description",
+        "checkbox label label", "shop", "categories",
+    }
+    if lowered in exact_noise:
+        return True
+
+    noise_patterns = [
+        r"^(pickup|delivery|shipping)(\s|$)",
+        r"^(same[- ]day delivery|enter address)(\s|$)",
+        r"^(household|paper (&|and) plastic|toilet paper)$",
+        r"^(reviews?|ingredients?|directions?|warnings?)$",
+        r"^(vaccines?|glp-?1|pharmacy|photo)(\s|$)",
+        r"^(buy again|frequently bought|you may also like|recommended)(\s|$)",
+    ]
+    if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in noise_patterns):
+        return True
+
+    # Real CVS bullets contain a meaningful claim or explanatory phrase. Very short
+    # category labels without punctuation are navigation, not product features.
+    if len(text) < 24 and not any(ch in text for ch in [":", "-", "—", ";", ","]):
+        return True
+    return False
+
+
 def normalize_cvs_features(items):
     cleaned = [clean_cvs_feature_text(x) for x in items if isinstance(x, str)]
-    cleaned = [x for x in cleaned if x]
+    cleaned = [x for x in cleaned if x and not is_cvs_non_product_feature(x)]
     cleaned = merge_feature_continuations(cleaned, max_features=5)
+    cleaned = [x for x in cleaned if x and not is_cvs_non_product_feature(x)]
     return dedupe_preserve_order(cleaned[:5])
 
 

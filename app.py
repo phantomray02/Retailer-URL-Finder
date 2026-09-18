@@ -2976,6 +2976,7 @@ def build_kroger_compact_capture_from_raw_html(raw_html_text, requested_url="", 
 # CVS CAPTURE AND PARSING
 CVS_PARSE_ONLY_IN_APP = True
 CVS_IGNORE_EXTENSION_PARSED_JSON = True
+CVS_REPORT_FIX_VERSION = "2026-09-18.2"
 CVS_APP_PARSER_FIX_VERSION = "2026-09-18.1"
 # =========================================================
 def build_cvs_compact_capture_from_parsed_json(payload):
@@ -7472,7 +7473,13 @@ def extract_cvs_images_from_html(html_text):
             full = raw_url
         else:
             return
-        if not re.search(r"/productimages/high_res/[^\s\"'<>]+\.(?:jpg|jpeg|png|webp|avif)", full, flags=re.IGNORECASE):
+        cvs_product_asset = bool(
+            re.search(r"/productimages/(?:high_res/)?[^\s\"'<>]+\.(?:jpg|jpeg|png|webp|avif)", full, flags=re.IGNORECASE)
+            or "damassetlibrary.cvsimages.com/" in full.lower()
+            or "cvsassets.blob.core.windows.net/productimages/" in full.lower()
+            or ("adobeaemcloud.com/" in full.lower() and re.search(r"\.(?:jpg|jpeg|png|webp|avif)(?:[?]|$)", full, flags=re.IGNORECASE))
+        )
+        if not cvs_product_asset:
             return
         base = full.split("?", 1)[0]
         name = base.split("/")[-1]
@@ -7492,6 +7499,12 @@ def extract_cvs_images_from_html(html_text):
         for m in re.findall(r"https?://[^\s\"'<>]+/productimages/high_res/[^\s\"'<>]+?\.(?:jpg|jpeg|png|webp|avif)(?:\?[^\s\"'<>]*)?", working, flags=re.IGNORECASE):
             sm = re.search(r"Resize=\((\d+)", m, flags=re.IGNORECASE)
             add_candidate(m, int(sm.group(1)) if sm else 0)
+        # App-only CVS gallery extraction from captured HTML/state.
+        for m in re.findall(r'https?://[^\s"\'<>]+(?:cvsimages\.com|cvsassets\.blob\.core\.windows\.net|adobeaemcloud\.com)/[^\s"\'<>]+', working, flags=re.IGNORECASE):
+            add_candidate(m, 0)
+        for array_body in re.findall(r'"(?:upcImages|alternateImages|images|media)"\s*:\s*\[(.*?)\]', working, flags=re.IGNORECASE | re.DOTALL):
+            for m in re.findall(r'https?(?::|\u003A)\?/\?/[^\s"\'<>\]]+', array_body, flags=re.IGNORECASE):
+                add_candidate(m.replace("\u003A", ":"), 0)
         for m in re.findall(r'"(?:dynamicMediaUrl|imageUrl|image|src|url|thumbnailUrl|largeImageUrl)"\s*:\s*"((?:\\.|[^"\\])+)"', working, flags=re.IGNORECASE | re.DOTALL):
             add_candidate(m, 0)
     try:
@@ -7872,9 +7885,11 @@ def _extract_cvs_text_from_html(html_text, retail_url="", target_rpc=""):
     elif not features:
         debug["Features Path"] = "features_empty"
 
+    # Last CVS-only cleanup before scoring/report rendering.
+    features = normalize_cvs_features(features)
     return {
-        "title": title,
-        "description": description,
+        "title": clean_cvs_text_refined(title),
+        "description": clean_cvs_text_refined(description),
         "features": features[:5],
         "rating": str(debug.get("CVS Structured Rating", "") or ""),
         "review_count": str(debug.get("CVS Structured Review Count", "") or ""),

@@ -3486,8 +3486,41 @@ def parse_uploaded_raw_html_map(raw_text, selected_retailer=""):
             raw_html_text = html.unescape(str(html_match.group(1) or "").strip()) if html_match else ""
             if compact_html:
                 if requested_url and "cvs.com" in requested_url.lower() and raw_html_text:
-                    cvs_raw_compact = build_cvs_compact_capture_from_raw_html(raw_html_text, requested_url=requested_url, final_url=final_url_from_payload)
-                    html_text = compact_html + ("\n" + cvs_raw_compact if cvs_raw_compact else "")
+                    # CVS-only fix: keep the extension PARSED JSON as the single copy source.
+                    # Appending a second raw compact document added another Product JSON-LD
+                    # block and the downstream CVS parser could select the wrong/empty block.
+                    # Pull only exact-product CVS image URLs from raw HTML and append img tags.
+                    target_sku_match = re.search(r"(?:prodid-|skuId=)(\d+)", requested_url, flags=re.IGNORECASE)
+                    target_sku = target_sku_match.group(1) if target_sku_match else ""
+                    raw_urls = []
+                    seen_raw_urls = set()
+                    url_patterns = [
+                        r"https?:\/\/www\.cvs\.com\/bizcontent\/merchandising\/productimages\/high_res\/[^\"'<>\s]+",
+                        r"https?:\/\/cvsassets\.blob\.core\.windows\.net\/productimages\/[^\"'<>\s]+",
+                        r"\/bizcontent\/merchandising\/productimages\/high_res\/[^\"'<>\s]+",
+                    ]
+                    for pattern in url_patterns:
+                        for match in re.finditer(pattern, raw_html_text, flags=re.IGNORECASE):
+                            image_url = html.unescape(match.group(0)).replace("\\/", "/").rstrip("\\,;)}]")
+                            if image_url.startswith("/"):
+                                image_url = "https://www.cvs.com" + image_url
+                            image_key = image_url.split("?", 1)[0].lower()
+                            if image_key in seen_raw_urls:
+                                continue
+                            # Exclude icons/logos and retain CVS product-image assets only.
+                            if any(token in image_key for token in ["sprite", "icon", "logo", "placeholder", ".svg"]):
+                                continue
+                            seen_raw_urls.add(image_key)
+                            raw_urls.append(image_url)
+                    if raw_urls:
+                        image_parts = ["<section data-cvs-raw-product-images='1'>"]
+                        for image_url in raw_urls[:MAX_IMAGE_SLOTS_TO_COMPARE]:
+                            safe_url = html.escape(image_url, quote=True)
+                            image_parts.append(f'<img src="{safe_url}" data-src="{safe_url}" data-cvs-product-image="1" />')
+                        image_parts.append("</section>")
+                        html_text = compact_html + "\n" + "\n".join(image_parts)
+                    else:
+                        html_text = compact_html
                 elif requested_url and "samsclub.com" in requested_url.lower():
                     # The extension PARSED JSON is exact-product scoped. Keep Sam's Club
                     # isolated to that verified copy/gallery instead of appending raw page
